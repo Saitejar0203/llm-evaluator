@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.env
+.venv
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+*.env
+
+# OpenRouter config (contains API keys)
+.openrouter_config
+openrouter_config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reports & analysis output
+analysis/*.json
+
+# Temp files
+.tmp/
+*.log
