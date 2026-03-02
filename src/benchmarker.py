@@ -1,10 +1,9 @@
-"""Benchmarking engine: runs test suite across candidate LLMs."""
+"""Benchmarking engine: runs test suite across candidate LLMs in parallel."""
 
 import logging
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
 from .openrouter_client import call_llm
 from .config import REQUEST_TIMEOUT
@@ -51,56 +50,103 @@ def run_single_test(model_id: str, test_case: dict, timeout: int = REQUEST_TIMEO
 def run_benchmark(
     candidates: list[dict],
     test_cases: list[dict],
-    max_workers: int = 3,
+    max_workers: int = 6,
 ) -> dict[str, list[dict]]:
     """
-    Run the full benchmark suite across all candidate models.
+    Run the full benchmark suite across all candidate models fully in parallel.
 
-    Uses thread-based parallelism to run models concurrently while
-    keeping per-model test ordering sequential.
+    All (model, test) combinations are dispatched concurrently, maximising
+    throughput. Results are collected as futures complete and assembled into
+    per-model ordered lists.
 
     Args:
         candidates: List of candidate model dicts (must have 'id' key)
         test_cases: List of test case dicts
-        max_workers: Max parallel model evaluations
+        max_workers: Max concurrent API calls (default 6 — one per model)
 
     Returns:
-        Dict mapping model_id -> list of result dicts
+        Dict mapping model_id -> list of result dicts (ordered by test_id)
     """
-    results: dict[str, list[dict]] = {c["id"]: [] for c in candidates}
+    # Pre-initialise result buckets preserving test order
+    results: dict[str, list[dict]] = {c["id"]: [None] * len(test_cases) for c in candidates}
+    test_index = {tc["id"]: idx for idx, tc in enumerate(test_cases)}
 
     total_calls = len(candidates) * len(test_cases)
     completed = 0
+    start_time = time.time()
 
-    logger.info(f"Starting benchmark: {len(candidates)} models × {len(test_cases)} tests = {total_calls} calls")
+    logger.info(
+        f"Starting parallel benchmark: {len(candidates)} models × "
+        f"{len(test_cases)} tests = {total_calls} concurrent API calls "
+        f"(max_workers={max_workers})"
+    )
 
-    def run_model_tests(candidate: dict) -> tuple[str, list[dict]]:
-        """Run all tests for a single model sequentially."""
+    def _run_task(candidate: dict, tc: dict) -> tuple[str, int, dict]:
+        """Execute a single (model, test) pair and return (model_id, test_idx, result)."""
         model_id = candidate["id"]
-        model_results = []
-        for tc in test_cases:
-            result = run_single_test(model_id, tc)
-            model_results.append(result)
-            status = "✓" if not result["error"] else "✗"
-            logger.info(
-                f"  [{status}] {model_id} | Test {tc['id']} | "
-                f"Latency: {result['latency']:.2f}s"
-            )
-        return model_id, model_results
+        result = run_single_test(model_id, tc)
+        return model_id, test_index[tc["id"]], result
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(run_model_tests, c): c["id"] for c in candidates}
-        for future in as_completed(futures):
-            model_id = futures[future]
-            try:
-                mid, model_results = future.result()
-                results[mid] = model_results
-                completed += len(model_results)
-                logger.info(f"Completed {model_id}: {len(model_results)} tests done ({completed}/{total_calls} total)")
-            except Exception as e:
-                logger.error(f"Model {model_id} benchmark failed: {e}")
+        # Submit ALL (model × test) combinations at once
+        future_to_info = {
+            executor.submit(_run_task, candidate, tc): (candidate["id"], tc["id"])
+            for candidate in candidates
+            for tc in test_cases
+        }
 
-    return results
+        for future in as_completed(future_to_info):
+            model_id_key, test_id_key = future_to_info[future]
+            try:
+                mid, tidx, result = future.result(timeout=REQUEST_TIMEOUT + 30)
+                results[mid][tidx] = result
+                completed += 1
+                status = "✓" if not result["error"] else "✗"
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"  [{status}] [{completed}/{total_calls}] {mid} | "
+                    f"Test {result['test_id']} | "
+                    f"Latency: {result['latency']:.2f}s | "
+                    f"Elapsed: {elapsed:.1f}s"
+                )
+            except FuturesTimeoutError:
+                logger.error(f"Timeout for {model_id_key} test {test_id_key}")
+                tidx = test_index.get(test_id_key, 0)
+                results[model_id_key][tidx] = {
+                    "model_id": model_id_key,
+                    "test_id": test_id_key,
+                    "test_category": "unknown",
+                    "test_difficulty": "unknown",
+                    "prompt": "",
+                    "response": "ERROR: Request timed out",
+                    "latency": float(REQUEST_TIMEOUT),
+                    "error": True,
+                    "evaluation_criteria": "",
+                    "expected_elements": [],
+                }
+                completed += 1
+            except Exception as e:
+                logger.error(f"Benchmark failed for {model_id_key} test {test_id_key}: {e}")
+                tidx = test_index.get(test_id_key, 0)
+                results[model_id_key][tidx] = {
+                    "model_id": model_id_key,
+                    "test_id": test_id_key,
+                    "test_category": "unknown",
+                    "test_difficulty": "unknown",
+                    "prompt": "",
+                    "response": f"ERROR: {str(e)}",
+                    "latency": 0.0,
+                    "error": True,
+                    "evaluation_criteria": "",
+                    "expected_elements": [],
+                }
+                completed += 1
+
+    total_elapsed = time.time() - start_time
+    logger.info(f"Benchmark complete: {completed}/{total_calls} calls in {total_elapsed:.1f}s")
+
+    # Filter out any None slots (shouldn't happen, but defensive)
+    return {mid: [r for r in res if r is not None] for mid, res in results.items()}
 
 
 def compute_latency_stats(results: list[dict]) -> dict:
