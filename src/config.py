@@ -40,12 +40,12 @@ def load_api_key() -> str:
 # Candidate model categories mapped to known top performers on OpenRouter
 MODEL_CATEGORIES = {
     "coding": [
-        "openai/gpt-4.1",
-        "google/gemini-2.5-pro",
-        "anthropic/claude-sonnet-4-5",
-        "deepseek/deepseek-r1-0528",
-        "qwen/qwen-2.5-coder-32b-instruct",
-        "meta-llama/llama-4-maverick",
+        "openai/gpt-5.3-codex",
+        "z-ai/glm-5",
+        "anthropic/claude-sonnet-4-6",
+        "moonshotai/kimi-k2.5",
+        "qwen/qwen3.5-397b-a17b",
+        "google/gemini-3-flash-preview",
     ],
     "math": [
         "google/gemini-2.5-pro",
