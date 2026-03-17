@@ -2,8 +2,6 @@
 
 Evaluates LLMs on metrics that matter for product decisions: hallucination resistance, faithfulness, abstention quality, tool calling efficiency, and accuracy. Uses a Judge LLM to score responses with category-aware rubrics.
 
-Built on top of [gauravvij/llm-evaluator](https://github.com/gauravvij/llm-evaluator), rewritten with PM-centric evaluation metrics and multi-turn tool calling.
-
 ## How It Works
 
 You describe your task in plain English (e.g., "Customer support chatbot for a fintech lending app"). The tool then:
@@ -162,6 +160,3 @@ Each report includes metric definitions so the results are self-explanatory.
 
 MIT License
 
-## Credits
-
-Originally forked from [gauravvij/llm-evaluator](https://github.com/gauravvij/llm-evaluator). Rewritten with PM-centric evaluation metrics, multi-turn tool calling, category-aware rubrics, and computed metrics (calibration, consistency, efficiency).
