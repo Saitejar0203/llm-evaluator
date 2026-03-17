@@ -1,240 +1,167 @@
-# 🤖 LLM Evaluator Tool
+# LLM Evaluator for Product Managers
 
-> Automated LLM Selection & Evaluation — find the best model for *your* task in minutes.
+Evaluates LLMs on metrics that matter for product decisions: hallucination resistance, faithfulness, abstention quality, tool calling efficiency, and accuracy. Uses a Judge LLM to score responses with category-aware rubrics.
 
-<div align="center">
+Built on top of [gauravvij/llm-evaluator](https://github.com/gauravvij/llm-evaluator), rewritten with PM-centric evaluation metrics and multi-turn tool calling.
 
-[![Made by NEO](https://img.shields.io/badge/Made%20by-NEO-6C63FF?style=for-the-badge&logo=sparkles&logoColor=white)](https://heyneo.com)
-[![OpenRouter](https://img.shields.io/badge/Powered%20by-OpenRouter-FF6B6B?style=for-the-badge)](https://openrouter.ai)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-22C55E?style=for-the-badge)](LICENSE)
+## How It Works
 
-**[Built by NEO](https://heyneo.com)** - Autonomous AI Engineering Agent
+You describe your task in plain English (e.g., "Customer support chatbot for a fintech lending app"). The tool then:
 
-</div>
+1. **Generates a knowledge base** from your task description using Gemini 3 Flash
+2. **Creates a test suite** across 6 categories: in-context, out-of-context, general knowledge, multi-fact, edge case, and off-topic
+3. **Runs all candidate models** through multi-turn tool calling (each model can search the knowledge base up to 3 times per question)
+4. **Scores every response** using Gemini 3.1 Pro as the Judge LLM
+5. **Ranks models** with strengths, weaknesses, cost, and latency breakdown
 
----
+## Evaluation Metrics
 
-## 🎬 Demo
+### Judge-Scored (by Gemini 3.1 Pro)
 
-![Demo](data/llm-evaluator-runtime.gif)
+| Metric | Weight | What It Measures |
+|--------|--------|-----------------|
+| Hallucination Resistance | 25% | Does the model make up facts? |
+| Faithfulness | 20% | Does it stick to what the knowledge base says? |
+| Abstention Quality | 20% | Does it say "I don't know" when it should? |
+| Tool Calling Efficiency | 20% | Does it search the KB when needed, skip it when not? |
+| Accuracy | 15% | Is the answer correct and complete? |
 
-> *Watch the LLM Evaluator Tool in action — from task input to ranked results in minutes.*
+Each metric is scored differently depending on the test category. For example, hallucination on an in-context question (where the answer exists in the KB) is evaluated differently than on an out-of-context question (where the model should abstain).
 
----
+### Computed from Response Data
 
-## ✨ What It Does
+- **Confidence Calibration** - gap between model's self-rated confidence and actual accuracy
+- **Consistency** - same answer when asked the same question 3 times (optional)
+- **Token Efficiency** - quality score per token spent
+- **Quality-Adjusted Cost** - cost normalized by quality
+- **Cost per Question** - actual dollar cost per answer including tool calls
 
-LLM Evaluator Tool automates the process of selecting and benchmarking the best LLMs for any task you define. It uses **Gemini 3.1 Pro** (via OpenRouter) as a Judge LLM to fairly evaluate candidate models across multiple dimensions.
-
-### Core Workflow
+## Architecture
 
 ```
-Your Task Description
-        │
-        ▼
-┌───────────────────┐
-│  1. Test Suite    │  Judge LLM generates tailored test cases
-│     Generation    │
-└────────┬──────────┘
-         │
-         ▼
-┌───────────────────┐
-│  2. Model         │  Discovers top LLMs for your task category
-│     Discovery     │
-└────────┬──────────┘
-         │
-         ▼
-┌───────────────────┐
-│  3. Benchmarking  │  Runs all tests across all candidate models
-│     Execution     │  (captures responses + latency)
-└────────┬──────────┘
-         │
-         ▼
-┌───────────────────┐
-│  4. Evaluation    │  Judge scores on accuracy, hallucination,
-│     (Judge LLM)   │  grounding, tool-calling, clarity
-└────────┬──────────┘
-         │
-         ▼
-┌───────────────────┐
-│  5. Ranking &     │  Top 3 models + latency stats +
-│     Prompt Opt.   │  optimized system prompt
-└───────────────────┘
+Task Description
+      |
+      v
+[Gemini 3 Flash] --> Knowledge Base (dict) + System Prompt + Test Suite
+                                                    |
+                                                    v
+                                    [6 Candidate Models via OpenRouter]
+                                    Multi-turn tool calling (up to 3 calls)
+                                    search_knowledge_base(query) tool
+                                                    |
+                                                    v
+                                    [Gemini 3.1 Pro - Judge]
+                                    Category-aware rubrics
+                                    5 metrics per response
+                                                    |
+                                                    v
+                                    Ranked Results + Cost Analysis
 ```
 
----
+**Generator:** Gemini 3 Flash ($0.50/M tokens) - creates knowledge base, system prompt, test suite
 
-## 🚀 Quick Start
+**Judge:** Gemini 3.1 Pro ($2.00/M tokens) - scores all responses with structured rubrics
 
-### 1. Clone the Repository
+**Candidates (default):** 6 models at similar price points (~$0.20-0.26/M input tokens):
+- google/gemini-3.1-flash-lite
+- openai/gpt-5-mini
+- qwen/qwen3.5-122b-a10b
+- minimax/minimax-m2.5
+- inception/mercury-2
+- mistralai/ministral-14b-2512
+
+## Quick Start
+
+### 1. Clone and install
 
 ```bash
-git clone https://github.com/gauravvij/llm-evaluator.git
+git clone https://github.com/Saitejar0203/llm-evaluator.git
 cd llm-evaluator
-```
-
-### 2. Set Up a Virtual Environment
-
-```bash
-python3 -m venv venv
+python -m venv venv
 source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure Your OpenRouter API Key
-
-The tool requires an [OpenRouter](https://openrouter.ai) API key. **Never hardcode your key** — use one of the two methods below:
-
-#### Option A — Environment Variable (Recommended)
-
-```bash
-export OPENROUTER_API_KEY="sk-or-v1-your-key-here"
-```
-
-Add this to your `~/.bashrc` or `~/.zshrc` to persist across sessions.
-
-#### Option B — `.env` File
-
-Copy the example file and fill in your key:
+### 2. Add your API key
 
 ```bash
 cp .env.example .env
+# Edit .env and add your OpenRouter API key
 ```
 
-Edit `.env`:
+Get a key at [openrouter.ai/keys](https://openrouter.ai/keys).
 
-```env
-OPENROUTER_API_KEY=sk-or-v1-your-key-here
-```
-
-> 🔑 **Get your free API key at [openrouter.ai/keys](https://openrouter.ai/keys)**
-
----
-
-## 🖥️ Usage
-
-### Interactive Mode
+### 3. Run
 
 ```bash
+# Interactive mode (prompts for task, number of tests, etc.)
 python main.py
+
+# CLI mode
+python main.py --task "Customer support chatbot for a fintech app"
+python main.py --task "Technical documentation Q&A bot" --num-tests 15
+python main.py --task "HR knowledge assistant" --consistency
 ```
 
-You'll be prompted to enter your task description.
-
-### CLI Mode
-
-```bash
-# Evaluate LLMs for a coding task
-python main.py --task "Python software engineering assistant"
-
-# Math tutoring with 3 test cases
-python main.py --task "Math tutoring for high school students" --num-tests 3
-
-# Customer support with 4 candidates, no report saved
-python main.py --task "Customer support chatbot" --max-candidates 4 --no-save
-
-# Custom output directory
-python main.py --task "Creative writing assistant" --output-dir ./results
-```
-
-### All CLI Options
+### CLI Options
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--task` | `-t` | *(prompted)* | Natural language task description |
-| `--num-tests` | `-n` | `5` | Number of test cases to generate |
-| `--max-candidates` | `-c` | `6` | Max candidate models to evaluate |
-| `--output-dir` | `-o` | `./analysis` | Directory to save JSON report |
-| `--no-save` | — | `False` | Skip saving the JSON report |
+| `--task` | `-t` | *(prompted)* | Task description |
+| `--num-tests` | `-n` | `10` | Number of test cases (minimum 6) |
+| `--output-dir` | `-o` | `./results` | Directory for markdown report |
+| `--no-save` | | `False` | Skip saving report |
+| `--consistency` | | `False` | Run consistency check (3 runs x 3 questions per model) |
 
----
+## Test Categories
 
-## 📊 Sample Output
+| Category | Share | Purpose |
+|----------|-------|---------|
+| In-Context | 25% | Answer exists in the knowledge base |
+| Out-of-Context | 25% | Answer is NOT in the knowledge base (model should abstain) |
+| Off-Topic | 15% | Completely unrelated to the task (tests role adherence) |
+| General Knowledge | 15% | Common knowledge, no KB needed |
+| Multi-Fact | 10% | Requires combining multiple KB sections |
+| Edge Case | 10% | Ambiguous or tricky questions |
 
-```
-╔══════════════════════════════════════════════════════╗
-║        LLM Evaluator Tool — Evaluation Report        ║
-╚══════════════════════════════════════════════════════╝
-
-Task: Python software engineering assistant
-
-── Step 1/5 — Generating Test Suite ──────────────────
-✓ Generated 5 test cases
-
-── Step 2/5 — Discovering Candidate Models ───────────
-✓ Found 6 candidate models
-
-── Step 3/5 — Running Benchmark ──────────────────────
-✓ 30 responses collected
-
-── Step 4/5 — Evaluating Responses ───────────────────
-✓ Judge scored all responses
-
-── Step 5/5 — Ranking & Prompt Optimization ──────────
-
-🏆 Top 3 Models for Your Task:
-
-  #1  google/gemini-2.5-pro          Score: 92.4  Latency: 1.8s avg
-  #2  openai/gpt-4.1                 Score: 89.1  Latency: 2.1s avg
-  #3  anthropic/claude-sonnet-4-5    Score: 87.6  Latency: 1.5s avg
-
-📝 Optimized System Prompt (for gemini-2.5-pro):
-  "You are an expert Python software engineer..."
-```
-
----
-
-## 🏗️ Project Structure
+## Project Structure
 
 ```
 llm-evaluator/
-├── main.py                  # CLI entry point
-├── requirements.txt         # Python dependencies
-├── .env.example             # Environment variable template
-├── .gitignore
-└── src/
-    ├── config.py            # Configuration & API key loading
-    ├── openrouter_client.py # OpenRouter API client
-    ├── suite_generator.py   # Test suite generation (Judge LLM)
-    ├── model_discovery.py   # Candidate model discovery
-    ├── benchmarker.py       # Parallel benchmarking engine
-    ├── evaluator.py         # Multi-dimensional evaluation
-    ├── prompt_optimizer.py  # Optimized prompt generation
-    └── reporter.py          # Rich CLI output & JSON reports
+├── main.py                  # CLI entry point (7-step pipeline)
+├── requirements.txt
+├── .env.example
+├── src/
+│   ├── config.py            # Models, pricing, evaluation dimensions
+│   ├── openrouter_client.py # OpenRouter API client (Generator + Judge)
+│   ├── suite_generator.py   # Knowledge base, system prompt, test suite generation
+│   ├── knowledge_base.py    # Tool schema + search_knowledge_base function
+│   ├── model_discovery.py   # Candidate model metadata from OpenRouter
+│   ├── benchmarker.py       # Parallel benchmarking with multi-turn tool calling
+│   ├── evaluator.py         # Judge evaluation with category-aware rubrics
+│   ├── consistency.py       # Optional consistency checker
+│   ├── schemas.py           # Pydantic models for test cases and scores
+│   └── reporter.py          # Rich terminal output + markdown report
+├── smoke_test.py            # Quick validation (2 models x 2 tests)
+├── test_implementation.py   # Unit tests (64 tests)
+├── results/                 # Generated evaluation reports
+└── data/                    # Research documents
 ```
 
----
+## Sample Results
 
-## 🔒 Security
+After running an evaluation, you get:
+- A ranked list of models with scores, strengths, and weaknesses
+- A comparison table across all metrics
+- Cost per question breakdown
+- A detailed markdown report saved to `results/`
 
-- **No API keys are ever hardcoded** in this codebase.
-- Keys are loaded exclusively from the `OPENROUTER_API_KEY` environment variable or a local `.env` file.
-- The `.gitignore` excludes `.env` files and any local config containing secrets.
-- **Never commit your `.env` file** or share your API key publicly.
+Each report includes metric definitions so the results are self-explanatory.
 
----
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/my-feature`
-3. Commit your changes: `git commit -m 'Add my feature'`
-4. Push to the branch: `git push origin feature/my-feature`
-5. Open a Pull Request
-
----
-
-## 📄 License
+## License
 
 MIT License
 
----
+## Credits
 
-<div align="center">
-
-### Built with ❤️ by
-
-[![Made by NEO](https://img.shields.io/badge/Made%20by-NEO-6C63FF?style=for-the-badge&logo=sparkles&logoColor=white)](https://heyneo.com)
-
-</div>
+Originally forked from [gauravvij/llm-evaluator](https://github.com/gauravvij/llm-evaluator). Rewritten with PM-centric evaluation metrics, multi-turn tool calling, category-aware rubrics, and computed metrics (calibration, consistency, efficiency).

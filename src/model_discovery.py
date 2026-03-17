@@ -1,60 +1,12 @@
-"""Dynamic model discovery via OpenRouter API."""
+"""Model discovery via OpenRouter API — simplified for fixed candidate list."""
 
-import json
 import logging
-import sys
-import re
-from typing import Optional
 
 import requests
 
-from .config import OPENROUTER_BASE_URL, MODEL_CATEGORIES, MAX_CANDIDATES, load_api_key
-from .openrouter_client import call_judge
+from .config import OPENROUTER_BASE_URL, CANDIDATE_MODELS, load_api_key
 
 logger = logging.getLogger(__name__)
-logger.addHandler(logging.StreamHandler(sys.stdout))
-
-
-CATEGORY_DETECTION_PROMPT = """You are an AI task classifier. Given a task description, identify the primary category.
-
-Task description: {task_description}
-
-Choose ONE category from this list:
-- coding (software engineering, programming, debugging, code review)
-- math (mathematics, statistics, calculations, proofs)
-- reasoning (logic, analysis, planning, problem-solving)
-- conversation (chatbots, customer service, dialogue, Q&A)
-- writing (content creation, summarization, translation, editing)
-- general (anything that doesn't fit the above)
-
-Return ONLY the category name, nothing else."""
-
-
-def detect_task_category(task_description: str) -> str:
-    """
-    Detect the task category using the Judge LLM.
-
-    Args:
-        task_description: Natural language task description
-
-    Returns:
-        Category string (e.g. 'coding', 'math', etc.)
-    """
-    messages = [
-        {"role": "user", "content": CATEGORY_DETECTION_PROMPT.format(task_description=task_description)}
-    ]
-    response = call_judge(messages, temperature=0.1, max_tokens=20)
-    category = response.strip().lower().split()[0] if response.strip() else "general"
-
-    # Validate against known categories
-    valid = set(MODEL_CATEGORIES.keys())
-    if category not in valid:
-        # Try partial match
-        for cat in valid:
-            if cat in response.lower():
-                return cat
-        return "general"
-    return category
 
 
 def fetch_available_models() -> list[dict]:
@@ -78,44 +30,29 @@ def fetch_available_models() -> list[dict]:
         return []
 
 
-def discover_candidate_models(task_description: str, max_candidates: int = MAX_CANDIDATES) -> list[dict]:
+def discover_candidate_models() -> list[dict]:
     """
-    Discover top candidate LLMs for the given task via OpenRouter.
+    Return configured candidate models enriched with OpenRouter metadata.
 
-    Strategy:
-    1. Detect task category using Judge LLM
-    2. Fetch available models from OpenRouter
-    3. Filter to known top performers for the category
-    4. Return enriched model metadata
-
-    Args:
-        task_description: Natural language task description
-        max_candidates: Maximum number of candidate models to return
+    Reads CANDIDATE_MODELS from config (no LLM call needed — models are fixed).
+    Enriches with live metadata (name, context length) from OpenRouter API.
 
     Returns:
-        List of candidate model dicts with id, name, category, context_length
+        List of candidate model dicts with id, name, context_length, pricing
     """
-    logger.info("Detecting task category...")
-    category = detect_task_category(task_description)
-    logger.info(f"Detected category: {category}")
+    logger.info(f"Loading {len(CANDIDATE_MODELS)} configured candidate models...")
 
-    # Get preferred models for this category
-    preferred_ids = MODEL_CATEGORIES.get(category, MODEL_CATEGORIES["general"])
-
-    # Fetch live model list from OpenRouter
+    # Fetch live model list for metadata enrichment
     available_models = fetch_available_models()
     available_ids = {m["id"]: m for m in available_models}
 
     candidates = []
-    for model_id in preferred_ids:
-        if len(candidates) >= max_candidates:
-            break
+    for model_id in CANDIDATE_MODELS:
         if model_id in available_ids:
             model_info = available_ids[model_id]
             candidates.append({
                 "id": model_id,
                 "name": model_info.get("name", model_id),
-                "category": category,
                 "context_length": model_info.get("context_length", 8192),
                 "pricing": model_info.get("pricing", {}),
             })
@@ -125,10 +62,9 @@ def discover_candidate_models(task_description: str, max_candidates: int = MAX_C
             candidates.append({
                 "id": model_id,
                 "name": model_id.split("/")[-1].replace("-", " ").title(),
-                "category": category,
                 "context_length": 8192,
                 "pricing": {},
             })
 
-    logger.info(f"Discovered {len(candidates)} candidate models for category '{category}'")
-    return candidates[:max_candidates]
+    logger.info(f"Loaded {len(candidates)} candidate models")
+    return candidates

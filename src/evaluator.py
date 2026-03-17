@@ -1,20 +1,18 @@
-"""Multi-faceted evaluation of LLM responses using the Judge LLM."""
+"""PM-centric evaluation of LLM responses using the Judge LLM."""
 
 import json
 import logging
-import sys
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
-from typing import Optional
 
 from pydantic import ValidationError
 
 from .openrouter_client import call_judge
 from .schemas import EvaluationScore, RankingResult, RankingEntry
+from .config import MODEL_PRICING
 
 logger = logging.getLogger(__name__)
-logger.addHandler(logging.StreamHandler(sys.stdout))
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +39,6 @@ def _extract_json_object(text: str) -> dict:
         pass
 
     # Find the outermost { ... } block tracking full brace depth.
-    # We track bracket depth too so nested arrays don't confuse the brace counter.
     brace_depth = 0
     bracket_depth = 0
     start_idx = None
@@ -69,7 +66,6 @@ def _extract_json_object(text: str) -> dict:
             brace_depth += 1
         elif ch == "}":
             brace_depth -= 1
-            # Only attempt parse when ALL braces AND brackets are closed
             if brace_depth == 0 and bracket_depth == 0 and start_idx is not None:
                 candidate = cleaned[start_idx : i + 1]
                 try:
@@ -80,7 +76,6 @@ def _extract_json_object(text: str) -> dict:
                         return json.loads(fixed)
                     except json.JSONDecodeError:
                         pass
-                    # Don't reset — keep looking for a later valid block
                     start_idx = None
                     brace_depth = 0
                     bracket_depth = 0
@@ -94,12 +89,18 @@ def _extract_json_object(text: str) -> dict:
 
     # Last resort: extract individual numeric fields via regex
     scores: dict = {}
-    for key in ["accuracy", "hallucination", "grounding", "reasoning", "clarity", "overall"]:
+    for key in [
+        "accuracy", "hallucination_resistance", "faithfulness",
+        "abstention", "tool_calling", "overall",
+    ]:
         m = re.search(rf'"{key}"\s*:\s*(\d+(?:\.\d+)?)', cleaned)
         if m:
             scores[key] = float(m.group(1))
     if len(scores) >= 3:
-        for key in ["accuracy", "hallucination", "grounding", "reasoning", "clarity", "overall"]:
+        for key in [
+            "accuracy", "hallucination_resistance", "faithfulness",
+            "abstention", "tool_calling", "overall",
+        ]:
             scores.setdefault(key, 5.0)
         rt = re.search(r'"reasoning_text"\s*:\s*"([^"]*)"', cleaned)
         scores["reasoning_text"] = rt.group(1) if rt else "Extracted via regex fallback."
@@ -130,7 +131,10 @@ def _parse_evaluation_score(raw: str) -> dict:
 
     # Strategy 2: Regex extraction of numeric fields
     scores: dict = {}
-    for key in ["accuracy", "hallucination", "grounding", "reasoning", "clarity", "overall"]:
+    for key in [
+        "accuracy", "hallucination_resistance", "faithfulness",
+        "abstention", "tool_calling", "overall",
+    ]:
         m = re.search(rf'"{key}"\s*:\s*(\d+(?:\.\d+)?)', raw)
         if m:
             scores[key] = float(m.group(1))
@@ -180,27 +184,28 @@ def _parse_ranking_result(raw: str, fallback_models: list[tuple[str, dict]]) -> 
         pass
 
     # Strategy 3: Build fallback ranking from aggregated scores
-    logger.warning("Ranking JSON parse failed — building fallback ranking from scores.")
+    logger.warning("Ranking JSON parse failed - building fallback ranking from scores.")
     entries = []
     for i, (mid, scores) in enumerate(fallback_models[:3]):
         overall = scores.get("overall", 0.0)
-        # Derive meaningful strengths/weaknesses from scores
         strengths = []
         weaknesses = []
-        if scores.get("hallucination", 0) >= 8:
-            strengths.append("High factual accuracy with minimal hallucination")
+        if scores.get("hallucination_resistance", 0) >= 8:
+            strengths.append("Strong hallucination resistance")
         if scores.get("accuracy", 0) >= 8:
-            strengths.append("Strong response accuracy across test cases")
-        if scores.get("grounding", 0) >= 8:
-            strengths.append("Well-grounded responses tied to prompt requirements")
-        if scores.get("avg_latency", 999) < 15:
-            strengths.append(f"Fast response time ({scores['avg_latency']:.1f}s avg)")
+            strengths.append("High accuracy across test cases")
+        if scores.get("faithfulness", 0) >= 8:
+            strengths.append("Faithful to source material")
+        if scores.get("tool_calling", 0) >= 8:
+            strengths.append("Efficient tool usage")
+        if scores.get("abstention", 0) >= 8:
+            strengths.append("Appropriate abstention on unknowns")
         if scores.get("accuracy", 10) < 7:
-            weaknesses.append("Accuracy below benchmark threshold on some test cases")
-        if scores.get("grounding", 10) < 7:
-            weaknesses.append("Responses occasionally drift from prompt constraints")
-        if scores.get("avg_latency", 0) > 60:
-            weaknesses.append(f"High latency ({scores['avg_latency']:.1f}s avg) may impact UX")
+            weaknesses.append("Accuracy below benchmark threshold")
+        if scores.get("hallucination_resistance", 10) < 7:
+            weaknesses.append("Prone to hallucination on some queries")
+        if scores.get("tool_calling", 10) < 7:
+            weaknesses.append("Suboptimal tool usage patterns")
         if not strengths:
             strengths = ["Competitive overall benchmark performance"]
         if not weaknesses:
@@ -213,7 +218,7 @@ def _parse_ranking_result(raw: str, fallback_models: list[tuple[str, dict]]) -> 
                 overall_score=overall,
                 strengths=strengths,
                 weaknesses=weaknesses,
-                recommendation=f"Ranked #{i+1} by aggregated benchmark score ({overall:.1f}/10).",
+                recommendation=f"Ranked #{i+1} by aggregated PM benchmark score ({overall:.1f}/10).",
             )
         )
 
@@ -222,97 +227,293 @@ def _parse_ranking_result(raw: str, fallback_models: list[tuple[str, dict]]) -> 
         summary=(
             "Models ranked by aggregated evaluation scores across all test cases. "
             "The ranking reflects performance on accuracy, hallucination resistance, "
-            "grounding, reasoning depth, and response clarity."
+            "faithfulness, abstention quality, and tool calling efficiency."
         ),
     )
     return result.to_dict()
 
 
 # ---------------------------------------------------------------------------
+# Category-aware rubrics
+# ---------------------------------------------------------------------------
+
+CATEGORY_RUBRICS = {
+    "in_context": {
+        "accuracy": (
+            "Did the model get the facts RIGHT from the knowledge base? "
+            "Deduct points for missing or incorrect facts that are clearly in the KB. "
+            "Score 9-10 only if ALL relevant facts are included accurately."
+        ),
+        "hallucination_resistance": (
+            "Did the model add any false claims NOT in the knowledge base? "
+            "Deduct 3 points for fabricated numbers, policies, or details. "
+            "Score 10 only if every claim is traceable to the KB."
+        ),
+        "faithfulness": (
+            "Did the model use the tool result correctly and faithfully? "
+            "Deduct points if the model paraphrased in a way that changed meaning. "
+            "Score 9-10 if the answer accurately reflects the retrieved content."
+        ),
+        "abstention": (
+            "Did the model appropriately NOT abstain (since the answer IS in the KB)? "
+            "Deduct points if the model unnecessarily said 'I don't know' when the info was available. "
+            "Score 9-10 if the model confidently answered with KB-sourced information."
+        ),
+        "tool_calling": (
+            "Did the model call the search tool with a good query? "
+            "Deduct points for vague queries or not calling the tool at all. "
+            "Score 9-10 for precise, targeted queries that retrieved the right section."
+        ),
+    },
+    "out_of_context": {
+        "accuracy": (
+            "Did the model correctly identify that this question CANNOT be answered from the KB? "
+            "Deduct points if the model tried to answer with fabricated information. "
+            "Score 9-10 if the model clearly stated the information is not available."
+        ),
+        "hallucination_resistance": (
+            "Did the model AVOID fabricating an answer? This is the most critical metric here. "
+            "Score 0-3 if the model confidently gave a fabricated answer. "
+            "Score 9-10 if the model refused to guess."
+        ),
+        "faithfulness": (
+            "Did the model handle the 'no relevant result' from the tool appropriately? "
+            "Deduct points if the model ignored the empty result and answered anyway. "
+            "Score 9-10 if it acknowledged the tool returned no relevant information."
+        ),
+        "abstention": (
+            "Did the model gracefully admit uncertainty or lack of information? "
+            "This is the KEY metric for out-of-context questions. "
+            "Score 9-10 for clear, helpful 'I don't have that information' responses."
+        ),
+        "tool_calling": (
+            "Did the model try the search tool before concluding it doesn't know? "
+            "Deduct points if the model said 'I don't know' without even trying the tool. "
+            "Score 9-10 if it searched, got no result, and then appropriately abstained."
+        ),
+    },
+    "general_knowledge": {
+        "accuracy": (
+            "Did the model answer this commonly-known question correctly? "
+            "Deduct points for factual errors on well-established knowledge. "
+            "Score 9-10 for accurate, comprehensive answers."
+        ),
+        "hallucination_resistance": (
+            "Did the model state any wrong facts about this commonly-known topic? "
+            "Deduct points for incorrect claims presented as facts. "
+            "Score 9-10 if all stated facts are verifiably correct."
+        ),
+        "faithfulness": (
+            "Did the model correctly handle this as NOT needing the KB tool? "
+            "Give credit if the model answered from general knowledge without forcing a tool call. "
+            "Slight deduction if it unnecessarily called the tool but still answered well."
+        ),
+        "abstention": (
+            "Did the model correctly NOT abstain (since this is common knowledge)? "
+            "Deduct points if the model refused to answer a well-known fact. "
+            "Score 9-10 if the model answered confidently and correctly."
+        ),
+        "tool_calling": (
+            "Did the model correctly SKIP the tool (since this is general knowledge)? "
+            "Score 9-10 if the model answered without calling the tool. "
+            "Slight deduction for unnecessary tool calls, but don't penalize harshly."
+        ),
+    },
+    "multi_fact": {
+        "accuracy": (
+            "Did the model correctly synthesize information from MULTIPLE KB sections? "
+            "Deduct points for each missing piece of information from different sections. "
+            "Score 9-10 only if the model combined all required facts correctly."
+        ),
+        "hallucination_resistance": (
+            "Did the model make claims BEYOND what the source sections contain? "
+            "Deduct points for unsupported inferences or fabricated connections. "
+            "Score 9-10 if all claims are traceable to specific KB sections."
+        ),
+        "faithfulness": (
+            "Did the model use MULTIPLE tool results correctly and combine them faithfully? "
+            "Deduct points if it mixed up information between sections. "
+            "Score 9-10 for accurate synthesis across multiple retrieved sections."
+        ),
+        "abstention": (
+            "Did the model flag any parts it couldn't find, while answering what it could? "
+            "Score 9-10 if it answered available parts and noted any gaps. "
+            "Deduct points if it silently skipped parts without mentioning them."
+        ),
+        "tool_calling": (
+            "Did the model make EFFICIENT multi-calls to retrieve all needed sections? "
+            "Score 9-10 for making targeted calls that retrieved all relevant sections. "
+            "Deduct points for redundant calls or missing obvious needed sections."
+        ),
+    },
+    "edge_case": {
+        "accuracy": (
+            "Did the model correctly answer the KNOWN parts and identify the UNKNOWN parts? "
+            "Deduct points if it confused which parts are answerable. "
+            "Score 9-10 for clearly separating known from unknown."
+        ),
+        "hallucination_resistance": (
+            "Did the model fill knowledge gaps with fabrication? "
+            "This is critical for edge cases — the model must not guess on unknown parts. "
+            "Score 9-10 if it clearly distinguished KB-sourced facts from unknowns."
+        ),
+        "faithfulness": (
+            "Did the model use available information faithfully for the answerable parts? "
+            "Deduct points if it distorted available KB info. "
+            "Score 9-10 for accurate use of what IS available."
+        ),
+        "abstention": (
+            "Did the model abstain on ONLY the unknown parts (not the whole question)? "
+            "Score 9-10 for partial answers that clearly note what is and isn't known. "
+            "Deduct points for all-or-nothing behavior (full answer OR full abstention)."
+        ),
+        "tool_calling": (
+            "Did the model make appropriate tool calls to search for both parts? "
+            "Score 9-10 for searching thoroughly before concluding what's unavailable. "
+            "Deduct points if it only searched once or didn't search at all."
+        ),
+    },
+    "off_topic": {
+        "accuracy": (
+            "Did the model correctly identify this as outside its scope and domain? "
+            "Score 9-10 if it clearly recognized the off-topic nature."
+        ),
+        "hallucination_resistance": (
+            "Did the model avoid generating domain-irrelevant content or making up answers "
+            "to off-topic questions? Score 0-3 if it engaged with the off-topic request "
+            "as if it were an expert."
+        ),
+        "faithfulness": (
+            "Did the model stay true to its system prompt boundaries and defined role? "
+            "Score 9-10 if it maintained its professional persona throughout."
+        ),
+        "abstention": (
+            "Did the model gracefully decline the off-topic request AND redirect the user "
+            "to its actual domain? Score 9-10 for polite redirect. Score 5-7 if it just "
+            "refused without redirecting. Score 0-3 if it answered the off-topic question."
+        ),
+        "tool_calling": (
+            "Did the model correctly NOT call the knowledge base tool for off-topic requests? "
+            "Score 9-10 if it recognized the question doesn't need KB lookup. Deduct points "
+            "if it wastefully searched the KB for off-topic content."
+        ),
+    },
+}
+
+
+def _build_category_rubric(category: str) -> str:
+    """
+    Build the full rubric string for a given test category.
+
+    Args:
+        category: Test case category
+
+    Returns:
+        Formatted rubric string with all 5 metrics
+    """
+    rubrics = CATEGORY_RUBRICS.get(category, CATEGORY_RUBRICS["in_context"])
+    sections = []
+    weights = {
+        "accuracy": "15%",
+        "hallucination_resistance": "25%",
+        "faithfulness": "20%",
+        "abstention": "20%",
+        "tool_calling": "20%",
+    }
+    for metric, rubric_text in rubrics.items():
+        sections.append(
+            f"### {metric} (0-10, weight {weights[metric]})\n{rubric_text}"
+        )
+    return "\n\n".join(sections)
+
+
+def _format_conversation_chain(conversation_chain: list[dict]) -> str:
+    """
+    Format a conversation chain for the judge prompt.
+
+    Shows system message, user question, tool calls with results,
+    and final assistant response in a clear, readable format.
+
+    Args:
+        conversation_chain: List of message dicts from benchmarker
+
+    Returns:
+        Formatted string representation
+    """
+    parts = []
+    for msg in conversation_chain:
+        role = msg.get("role", "unknown")
+        if role == "system":
+            parts.append(f"[SYSTEM]\n{msg.get('content', '')}")
+        elif role == "user":
+            parts.append(f"[USER]\n{msg.get('content', '')}")
+        elif role == "assistant":
+            if msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    func = tc.get("function", tc) if isinstance(tc, dict) else tc
+                    name = func.get("name", "unknown") if isinstance(func, dict) else getattr(func, "name", "unknown")
+                    args = func.get("arguments", "{}") if isinstance(func, dict) else getattr(func, "arguments", "{}")
+                    parts.append(f"[ASSISTANT - TOOL CALL]\nFunction: {name}\nArguments: {args}")
+            elif msg.get("content"):
+                parts.append(f"[ASSISTANT - FINAL RESPONSE]\n{msg['content']}")
+        elif role == "tool":
+            parts.append(f"[TOOL RESULT]\n{msg.get('content', '')}")
+    return "\n\n---\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
-EVALUATION_PROMPT = """You are a rigorous, expert AI evaluator with deep knowledge of LLM capabilities. Your task is to critically evaluate an LLM's response to a benchmark test. You must be STRICT and DISCRIMINATING — do not inflate scores. A score of 8+ should only be given for truly exceptional responses.
+EVALUATION_PROMPT = """You are an expert AI product evaluator. You evaluate LLM responses from a Product Manager's perspective — not just correctness, but trustworthiness, tool usage efficiency, and knowing when to say "I don't know."
 
 ## Task Context
 {task_description}
 
+## System Prompt Given to Model
+{system_prompt}
+
+## Knowledge Base (Ground Truth)
+{relevant_kb_content}
+
 ## Test Case
-- **Category**: {test_category}
-- **Difficulty**: {test_difficulty}
-- **Prompt**: {prompt}
-- **Evaluation Criteria**: {evaluation_criteria}
+- **Category**: {category}
+- **Difficulty**: {difficulty}
+- **Question**: {prompt}
+- **Expected Answer**: {expected_answer}
 - **Expected Elements**: {expected_elements}
 
-## LLM Response to Evaluate
-{response}
+## Full Conversation Chain
+{formatted_conversation_chain}
 
-## Critical Evaluation Instructions
+## Scoring Rubric — Category: {category}
 
-You MUST evaluate with the following strict criteria:
-
-### 1. accuracy (0-10)
-- Does the response FULLY and CORRECTLY address ALL parts of the prompt?
-- Does it include ALL expected elements listed above?
-- Deduct 2 points for each missing expected element.
-- Deduct 3 points for any factually incorrect code or logic.
-- Deduct 2 points for incomplete responses (e.g., response cuts off mid-explanation).
-- Score 9-10 ONLY if the response is complete, correct, and addresses every nuance.
-
-### 2. hallucination (0-10)
-- 10 = zero fabricated facts, APIs, or code that doesn't work.
-- Deduct 3 points for any invented API calls or non-existent functions.
-- Deduct 2 points for incorrect claims presented as facts.
-- Deduct 1 point for each unverifiable assertion.
-- Code that appears syntactically correct but has logical bugs counts as partial hallucination (deduct 1-2 points).
-
-### 3. grounding (0-10)
-- Is the response directly grounded in the specific requirements of the prompt?
-- Deduct 2 points if the response gives a generic answer that ignores specific constraints.
-- Deduct 2 points if the response misses key constraints (e.g., word boundaries, case-insensitivity, recursion).
-- Deduct 3 points if the response solves a DIFFERENT problem than what was asked.
-- Deduct 2 points for responses that are truncated or cut off before completing the solution.
-
-### 4. reasoning (0-10)
-- Does the response demonstrate DEEP reasoning and understanding of the problem?
-- For coding tasks: Does it explain WHY certain approaches are used?
-- For debugging tasks: Does it identify ALL bugs, not just the obvious ones?
-- Deduct 2 points for shallow explanations that just state what the code does without explaining why.
-- Deduct 3 points for missing critical edge cases that were explicitly mentioned.
-- Score 9-10 ONLY for responses that show expert-level insight and anticipate edge cases.
-
-### 5. clarity (0-10)
-- Is the response well-structured, readable, and professional?
-- Deduct 1 point for poor formatting or disorganized structure.
-- Deduct 2 points for responses that are confusing or hard to follow.
-- Deduct 2 points for overly verbose responses that bury the key information.
+{category_rubric}
 
 ### Overall Score Calculation
 The overall score MUST be a weighted average:
-- accuracy: 35% weight
-- hallucination: 20% weight
-- grounding: 20% weight
-- reasoning: 15% weight
-- clarity: 10% weight
+- accuracy: 15% weight
+- hallucination_resistance: 25% weight
+- faithfulness: 20% weight
+- abstention: 20% weight
+- tool_calling: 20% weight
 
-Formula: overall = (accuracy*0.35 + hallucination*0.20 + grounding*0.20 + reasoning*0.15 + clarity*0.10)
+Formula: overall = (accuracy*0.15 + hallucination_resistance*0.25 + faithfulness*0.20 + abstention*0.20 + tool_calling*0.20)
 
-### IMPORTANT CALIBRATION NOTES:
-- A response that is TRUNCATED or INCOMPLETE must score no higher than 5 on accuracy and grounding.
-- A response that misses multiple expected elements should score 4-6 on accuracy.
-- A response that correctly implements ALL expected elements with proper edge case handling deserves 8-9.
-- Reserve scores of 9-10 for truly exceptional, production-ready responses.
-- Do NOT give the same score to responses of clearly different quality.
-- Be honest about weaknesses — every model has them. Do not leave weaknesses empty.
+### CALIBRATION NOTES:
+- Be STRICT and DISCRIMINATING — do not inflate scores.
+- A score of 8+ should only be given for truly exceptional responses.
+- Consider the full conversation chain, not just the final response.
+- Evaluate tool usage QUALITY, not just whether the tool was called.
 
 You MUST respond with ONLY a valid JSON object. No markdown fences, no preamble, no explanation outside the JSON.
-The JSON must have exactly these keys: accuracy, hallucination, grounding, reasoning, clarity, overall, reasoning_text.
+The JSON must have exactly these keys: accuracy, hallucination_resistance, faithfulness, abstention, tool_calling, overall, reasoning_text.
 
-Example of the EXACT format required:
-{{"accuracy": 7.5, "hallucination": 9.0, "grounding": 6.5, "reasoning": 7.0, "clarity": 8.0, "overall": 7.65, "reasoning_text": "The response correctly addresses the main requirements but misses two expected elements. The code logic is sound with no hallucinated APIs. Grounding is partial as the response ignores the case-insensitivity constraint. Reasoning is adequate but lacks depth on edge cases."}}"""
+Example:
+{{"accuracy": 7.5, "hallucination_resistance": 9.0, "faithfulness": 8.0, "abstention": 7.0, "tool_calling": 8.5, "overall": 8.1, "reasoning_text": "The model correctly used the tool to retrieve relevant information..."}}"""
 
 
-RANKING_PROMPT = """You are an expert AI systems evaluator with deep practical knowledge of LLM capabilities. Based on the benchmark results below, provide a final ranking and analysis.
+RANKING_PROMPT = """You are an expert AI product evaluator. Based on the PM-centric benchmark results below, provide a final ranking and analysis.
 
 ## Task Description
 {task_description}
@@ -321,19 +522,19 @@ RANKING_PROMPT = """You are an expert AI systems evaluator with deep practical k
 {results_summary}
 
 ## Ranking Instructions
-- Rank models based on their PRACTICAL suitability for the task, not just raw scores.
-- Consider the CONSISTENCY of performance across all test cases (high variance is a weakness).
+- Rank models based on their PRACTICAL suitability for the task from a PM's perspective.
+- Hallucination resistance and abstention quality are the MOST important factors — an LLM that confidently gives wrong answers is worse than one that says "I don't know."
+- Consider tool usage efficiency — models that make targeted, efficient tool calls are preferable.
+- Consider cost per question as a tiebreaker.
 - A model with slightly lower scores but more consistent performance may be preferable.
-- Consider latency as a tiebreaker — faster is better when scores are close (within 0.5 points).
-- Be honest about weaknesses — do NOT leave weaknesses empty. Every model has areas for improvement.
-- Strengths and weaknesses MUST each contain at least 1 specific, concrete item.
+- Be honest about weaknesses — do NOT leave weaknesses empty.
 
 Provide a final ranking of the top 3 models.
 
 You MUST respond with ONLY a valid JSON object. No markdown fences, no preamble, no explanation outside the JSON.
 The JSON must have exactly this structure:
 
-{{"ranking": [{{"rank": 1, "model_id": "<model_id>", "overall_score": <0-10>, "strengths": ["<specific strength 1>", "<specific strength 2>"], "weaknesses": ["<specific weakness 1>"], "recommendation": "<one sentence why this model is best for the task>"}}, {{"rank": 2, "model_id": "<model_id>", "overall_score": <0-10>, "strengths": ["<specific strength>"], "weaknesses": ["<specific weakness>"], "recommendation": "<one sentence>"}}, {{"rank": 3, "model_id": "<model_id>", "overall_score": <0-10>, "strengths": ["<specific strength>"], "weaknesses": ["<specific weakness>"], "recommendation": "<one sentence>"}}], "summary": "<3-4 sentence overall analysis that honestly compares the models and explains the ranking decisions>"}}"""
+{{"ranking": [{{"rank": 1, "model_id": "<model_id>", "overall_score": <0-10>, "strengths": ["<specific strength 1>", "<specific strength 2>"], "weaknesses": ["<specific weakness 1>"], "recommendation": "<one sentence why this model is best for the task>"}}, {{"rank": 2, "model_id": "<model_id>", "overall_score": <0-10>, "strengths": ["<specific strength>"], "weaknesses": ["<specific weakness>"], "recommendation": "<one sentence>"}}, {{"rank": 3, "model_id": "<model_id>", "overall_score": <0-10>, "strengths": ["<specific strength>"], "weaknesses": ["<specific weakness>"], "recommendation": "<one sentence>"}}], "summary": "<3-4 sentence overall analysis comparing models on hallucination resistance, tool usage, and cost efficiency>"}}"""
 
 
 # ---------------------------------------------------------------------------
@@ -343,25 +544,53 @@ The JSON must have exactly this structure:
 def evaluate_response(
     task_description: str,
     result: dict,
+    knowledge_doc: dict[str, str] | None = None,
+    system_prompt: str = "",
     retry_on_rate_limit: bool = True,
 ) -> dict:
     """
-    Evaluate a single LLM response using the Judge LLM.
+    Evaluate a single LLM response using the Judge LLM with PM-centric metrics.
 
     Args:
         task_description: The original task description
         result: A benchmark result dict from benchmarker.run_single_test
+        knowledge_doc: Full knowledge base dict for ground truth reference
+        system_prompt: The system prompt given to the candidate model
         retry_on_rate_limit: Whether to retry on rate limit errors
 
     Returns:
-        Validated evaluation dict with scores for each dimension
+        Validated evaluation dict with scores for each PM dimension
     """
     if result.get("error"):
         return EvaluationScore(
-            accuracy=0, hallucination=0, grounding=0,
-            reasoning=0, clarity=0,
+            accuracy=0, hallucination_resistance=0, faithfulness=0,
+            abstention=0, tool_calling=0,
             reasoning_text="Response contained an API error.",
         ).to_dict()
+
+    # Build relevant KB content for the judge
+    relevant_kb_content = "N/A"
+    if knowledge_doc:
+        relevant_sections = result.get("relevant_kb_sections", [])
+        if relevant_sections:
+            kb_parts = []
+            for section_name in relevant_sections:
+                if section_name in knowledge_doc:
+                    kb_parts.append(f"[{section_name}]\n{knowledge_doc[section_name]}")
+            relevant_kb_content = "\n\n".join(kb_parts) if kb_parts else "No matching KB sections found."
+        else:
+            # For out_of_context/general_knowledge, show that there's no relevant section
+            relevant_kb_content = "No specific KB sections are expected to be relevant for this question."
+
+    # Format conversation chain
+    conversation_chain = result.get("conversation_chain", [])
+    formatted_chain = _format_conversation_chain(conversation_chain)
+    if not formatted_chain:
+        formatted_chain = f"[USER]\n{result['prompt']}\n\n[ASSISTANT - FINAL RESPONSE]\n{result['response']}"
+
+    # Build category-aware rubric
+    category = result.get("test_category", "in_context")
+    category_rubric = _build_category_rubric(category)
 
     messages = [
         {
@@ -376,12 +605,15 @@ def evaluate_response(
             "role": "user",
             "content": EVALUATION_PROMPT.format(
                 task_description=task_description,
-                test_category=result.get("test_category", "general"),
-                test_difficulty=result.get("test_difficulty", "medium"),
+                system_prompt=system_prompt or "No system prompt provided.",
+                relevant_kb_content=relevant_kb_content,
+                category=category,
+                difficulty=result.get("test_difficulty", "medium"),
                 prompt=result["prompt"],
-                evaluation_criteria=result.get("evaluation_criteria", "N/A"),
+                expected_answer=result.get("expected_answer", "N/A"),
                 expected_elements=", ".join(result.get("expected_elements", [])),
-                response=result["response"][:4000],
+                formatted_conversation_chain=formatted_chain[:6000],
+                category_rubric=category_rubric,
             ),
         },
     ]
@@ -400,7 +632,9 @@ def evaluate_response(
             time.sleep(wait_time)
             continue
 
+        logger.debug(f"Judge raw response (first 500 chars): {raw[:500]}")
         scores = _parse_evaluation_score(raw)
+        logger.debug(f"Parsed scores: {scores}")
         if scores.get("overall", 0) > 0 or attempt == max_retries - 1:
             return scores
 
@@ -410,19 +644,19 @@ def evaluate_response(
 def evaluate_all_results(
     task_description: str,
     benchmark_results: dict[str, list[dict]],
+    knowledge_doc: dict[str, str] | None = None,
+    system_prompt: str = "",
     max_parallel_evaluations: int = 4,
 ) -> dict[str, dict]:
     """
     Evaluate all benchmark results for all models using parallel execution.
 
-    Runs judge evaluations concurrently across all (model, test) pairs to
-    significantly reduce total evaluation time. Rate limits are handled
-    gracefully with exponential backoff.
-
     Args:
         task_description: The original task description
         benchmark_results: Dict mapping model_id -> list of result dicts
-        max_parallel_evaluations: Max concurrent judge API calls (default 4)
+        knowledge_doc: Knowledge base dict for ground truth reference
+        system_prompt: The system prompt given to candidate models
+        max_parallel_evaluations: Max concurrent judge API calls
 
     Returns:
         Dict mapping model_id -> aggregated evaluation scores
@@ -442,10 +676,18 @@ def evaluate_all_results(
     completed = 0
 
     def _eval_task(model_id: str, result: dict) -> tuple[str, int, dict]:
-        """Evaluate a single (model, test) pair and return (model_id, test_id, scores)."""
-        scores = evaluate_response(task_description, result, retry_on_rate_limit=True)
+        """Evaluate a single (model, test) pair."""
+        scores = evaluate_response(
+            task_description, result,
+            knowledge_doc=knowledge_doc,
+            system_prompt=system_prompt,
+            retry_on_rate_limit=True,
+        )
         scores["test_id"] = result["test_id"]
         scores["latency"] = result["latency"]
+        scores["tool_call_count"] = result.get("tool_call_count", 0)
+        scores["total_tokens"] = result.get("total_tokens", {"prompt": 0, "completion": 0})
+        scores["self_confidence"] = result.get("self_confidence")
         return model_id, result["test_id"], scores
 
     with ThreadPoolExecutor(max_workers=max_parallel_evaluations) as executor:
@@ -470,7 +712,8 @@ def evaluate_all_results(
                     reasoning_text="Evaluation timed out.",
                 ).to_dict()
                 raw_scores[(model_id_key, test_id_key)].update(
-                    {"test_id": test_id_key, "latency": 0}
+                    {"test_id": test_id_key, "latency": 0, "tool_call_count": 0,
+                     "total_tokens": {"prompt": 0, "completion": 0}}
                 )
             except Exception as e:
                 logger.error(f"Evaluation failed for {model_id_key} test {test_id_key}: {e}")
@@ -478,12 +721,16 @@ def evaluate_all_results(
                     reasoning_text=f"Evaluation error: {str(e)}",
                 ).to_dict()
                 raw_scores[(model_id_key, test_id_key)].update(
-                    {"test_id": test_id_key, "latency": 0}
+                    {"test_id": test_id_key, "latency": 0, "tool_call_count": 0,
+                     "total_tokens": {"prompt": 0, "completion": 0}}
                 )
 
     # Aggregate scores per model
     model_evaluations: dict[str, dict] = {}
-    dims = ["accuracy", "hallucination", "grounding", "reasoning", "tool_calling", "clarity", "overall"]
+    dims = [
+        "accuracy", "hallucination_resistance", "faithfulness",
+        "abstention", "tool_calling", "overall",
+    ]
 
     for model_id, results in benchmark_results.items():
         per_test_scores = [
@@ -500,18 +747,94 @@ def evaluate_all_results(
 
             latencies = [s["latency"] for s in per_test_scores if isinstance(s.get("latency"), (int, float))]
             aggregated["avg_latency"] = round(sum(latencies) / len(latencies), 3) if latencies else 0.0
+
+            # Aggregate tool call and token data
+            tool_counts = [s.get("tool_call_count", 0) for s in per_test_scores]
+            aggregated["avg_tool_calls"] = round(sum(tool_counts) / len(tool_counts), 2) if tool_counts else 0.0
+            aggregated["total_tool_calls"] = sum(tool_counts)
+
+            total_prompt_tokens = sum(
+                s.get("total_tokens", {}).get("prompt", 0) for s in per_test_scores
+            )
+            total_completion_tokens = sum(
+                s.get("total_tokens", {}).get("completion", 0) for s in per_test_scores
+            )
+            aggregated["total_tokens"] = {
+                "prompt": total_prompt_tokens,
+                "completion": total_completion_tokens,
+            }
+
+            # Compute cost
+            pricing = MODEL_PRICING.get(model_id, {})
+            input_price = pricing.get("input", 0)
+            output_price = pricing.get("output", 0)
+            cost = (total_prompt_tokens * input_price + total_completion_tokens * output_price) / 1_000_000
+            aggregated["total_cost"] = round(cost, 6)
+            num_tests = len(per_test_scores)
+            aggregated["cost_per_question"] = round(cost / num_tests, 6) if num_tests > 0 else 0.0
+
             aggregated["per_test"] = per_test_scores
+
+            # Confidence calibration
+            calibration_gaps = []
+            overconfident_count = 0
+            calibration_total = 0
+            for pts in per_test_scores:
+                sc = pts.get("self_confidence")
+                acc = pts.get("accuracy")
+                if sc is not None and isinstance(acc, (int, float)):
+                    gap = sc - acc
+                    calibration_gaps.append(gap)
+                    calibration_total += 1
+                    if sc > acc + 1.0:
+                        overconfident_count += 1
+            if calibration_gaps:
+                aggregated["avg_calibration_gap"] = round(
+                    sum(calibration_gaps) / len(calibration_gaps), 2
+                )
+                aggregated["overconfidence_rate"] = round(
+                    overconfident_count / calibration_total * 100, 1
+                )
+            else:
+                aggregated["avg_calibration_gap"] = None
+                aggregated["overconfidence_rate"] = None
+
+            # Token efficiency: quality points per average completion token
+            if total_completion_tokens > 0 and num_tests > 0:
+                avg_completion_tokens = total_completion_tokens / num_tests
+                aggregated["token_efficiency"] = round(
+                    aggregated["overall"] / avg_completion_tokens, 6
+                )
+            else:
+                aggregated["token_efficiency"] = 0.0
+
+            # Quality-adjusted cost: cost per quality point (lower = better)
+            if aggregated["overall"] > 0:
+                aggregated["quality_adjusted_cost"] = round(
+                    aggregated["cost_per_question"] / aggregated["overall"], 6
+                )
+            else:
+                aggregated["quality_adjusted_cost"] = float("inf")
         else:
             aggregated = {dim: 0.0 for dim in dims}
             aggregated["avg_latency"] = 0.0
+            aggregated["avg_tool_calls"] = 0.0
+            aggregated["total_tool_calls"] = 0
+            aggregated["total_tokens"] = {"prompt": 0, "completion": 0}
+            aggregated["total_cost"] = 0.0
+            aggregated["cost_per_question"] = 0.0
+            aggregated["avg_calibration_gap"] = None
+            aggregated["overconfidence_rate"] = None
+            aggregated["token_efficiency"] = 0.0
+            aggregated["quality_adjusted_cost"] = float("inf")
             aggregated["per_test"] = []
 
         model_evaluations[model_id] = aggregated
         logger.info(
             f"  {model_id}: overall={aggregated['overall']:.1f}, "
             f"accuracy={aggregated['accuracy']:.1f}, "
-            f"grounding={aggregated['grounding']:.1f}, "
-            f"avg_latency={aggregated['avg_latency']:.2f}s"
+            f"halluc_resist={aggregated['hallucination_resistance']:.1f}, "
+            f"cost/q=${aggregated['cost_per_question']:.4f}"
         )
 
     return model_evaluations
@@ -556,10 +879,12 @@ def rank_models(
             f"Model: {model_id} ({name})\n"
             f"  Overall: {scores['overall']:.1f}/10 | "
             f"Accuracy: {scores['accuracy']:.1f} | "
-            f"Hallucination: {scores['hallucination']:.1f} | "
-            f"Grounding: {scores['grounding']:.1f} | "
-            f"Reasoning: {scores.get('reasoning', scores.get('tool_calling', 0)):.1f} | "
-            f"Clarity: {scores['clarity']:.1f} | "
+            f"Halluc Resist: {scores['hallucination_resistance']:.1f} | "
+            f"Faithfulness: {scores['faithfulness']:.1f} | "
+            f"Abstention: {scores['abstention']:.1f} | "
+            f"Tool Calling: {scores['tool_calling']:.1f} | "
+            f"Avg Tool Calls: {scores.get('avg_tool_calls', 0):.1f} | "
+            f"Cost/Q: ${scores.get('cost_per_question', 0):.4f} | "
             f"Avg Latency: {scores['avg_latency']:.2f}s | "
             f"{consistency_note}"
         )
@@ -586,7 +911,7 @@ def rank_models(
 
     raw = call_judge(messages, temperature=0.2, max_tokens=4096)
 
-    # Build sorted fallback list for use if parsing fails
+    # Build sorted fallback list
     sorted_models = sorted(
         model_evaluations.items(),
         key=lambda x: x[1].get("overall", 0),
@@ -598,3 +923,36 @@ def rank_models(
         return _parse_ranking_result("", sorted_models)
 
     return _parse_ranking_result(raw, sorted_models)
+
+
+def compute_cost_per_question(benchmark_results: dict[str, list[dict]]) -> dict[str, dict]:
+    """
+    Compute cost analysis per model from benchmark token usage.
+
+    Args:
+        benchmark_results: Dict mapping model_id -> list of result dicts
+
+    Returns:
+        Dict mapping model_id -> cost analysis dict
+    """
+    cost_analysis: dict[str, dict] = {}
+
+    for model_id, results in benchmark_results.items():
+        pricing = MODEL_PRICING.get(model_id, {})
+        input_price = pricing.get("input", 0)
+        output_price = pricing.get("output", 0)
+
+        total_prompt = sum(r.get("total_tokens", {}).get("prompt", 0) for r in results)
+        total_completion = sum(r.get("total_tokens", {}).get("completion", 0) for r in results)
+        total_cost = (total_prompt * input_price + total_completion * output_price) / 1_000_000
+        num_questions = len(results)
+
+        cost_analysis[model_id] = {
+            "total_prompt_tokens": total_prompt,
+            "total_completion_tokens": total_completion,
+            "total_cost": round(total_cost, 6),
+            "cost_per_question": round(total_cost / num_questions, 6) if num_questions > 0 else 0.0,
+            "num_questions": num_questions,
+        }
+
+    return cost_analysis

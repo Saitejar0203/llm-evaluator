@@ -38,6 +38,9 @@ Thumbs.db
 # Reports & analysis output
 analysis/*.json
 
+# Logs
+logs/
+*.log
+
 # Temp files
 .tmp/
-*.log

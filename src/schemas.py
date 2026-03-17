@@ -1,24 +1,27 @@
 """Pydantic schemas for structured Judge LLM output validation."""
 
-from typing import Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class EvaluationScore(BaseModel):
-    """Schema for a single LLM response evaluation by the Judge."""
+    """Schema for a single LLM response evaluation by the Judge (PM-centric metrics)."""
 
     accuracy: float = Field(default=5.0, ge=0.0, le=10.0, description="Accuracy score 0-10")
-    hallucination: float = Field(default=5.0, ge=0.0, le=10.0, description="Anti-hallucination score 0-10")
-    grounding: float = Field(default=5.0, ge=0.0, le=10.0, description="Grounding score 0-10")
-    reasoning: float = Field(default=5.0, ge=0.0, le=10.0, description="Reasoning depth score 0-10")
-    clarity: float = Field(default=5.0, ge=0.0, le=10.0, description="Clarity score 0-10")
+    hallucination_resistance: float = Field(default=5.0, ge=0.0, le=10.0, description="Hallucination resistance score 0-10")
+    faithfulness: float = Field(default=5.0, ge=0.0, le=10.0, description="Faithfulness to source material 0-10")
+    abstention: float = Field(default=5.0, ge=0.0, le=10.0, description="Appropriate abstention behavior 0-10")
+    tool_calling: float = Field(default=5.0, ge=0.0, le=10.0, description="Tool usage quality 0-10")
     overall: float = Field(default=5.0, ge=0.0, le=10.0, description="Weighted overall score 0-10")
     reasoning_text: str = Field(
         default="No reasoning provided.",
         description="3-4 sentence critical justification",
     )
 
-    @field_validator("accuracy", "hallucination", "grounding", "reasoning", "clarity", "overall", mode="before")
+    @field_validator(
+        "accuracy", "hallucination_resistance", "faithfulness",
+        "abstention", "tool_calling", "overall",
+        mode="before",
+    )
     @classmethod
     def coerce_float(cls, v):
         """Coerce numeric strings and clamp to valid range."""
@@ -39,20 +42,18 @@ class EvaluationScore(BaseModel):
     def recalculate_overall(self) -> "EvaluationScore":
         """Recalculate overall using the canonical weighted formula."""
         self.overall = round(
-            self.accuracy * 0.35
-            + self.hallucination * 0.20
-            + self.grounding * 0.20
-            + self.reasoning * 0.15
-            + self.clarity * 0.10,
+            self.accuracy * 0.15
+            + self.hallucination_resistance * 0.25
+            + self.faithfulness * 0.20
+            + self.abstention * 0.20
+            + self.tool_calling * 0.20,
             2,
         )
         return self
 
     def to_dict(self) -> dict:
-        """Return as plain dict with tool_calling alias for backward compatibility."""
-        d = self.model_dump()
-        d["tool_calling"] = d["reasoning"]  # backward compat alias
-        return d
+        """Return as plain dict."""
+        return self.model_dump()
 
 
 class RankingEntry(BaseModel):
@@ -75,7 +76,6 @@ class RankingEntry(BaseModel):
         if v is None:
             return []
         if isinstance(v, str):
-            # Handle case where LLM returns a comma-separated string
             return [item.strip() for item in v.split(",") if item.strip()]
         return list(v)
 
@@ -150,7 +150,7 @@ class TestCase(BaseModel):
     """Schema for a generated test case."""
 
     id: int = Field(ge=1, description="Test case ID")
-    category: str = Field(default="general", description="Test category")
+    category: str = Field(default="in_context", description="Test category")
     prompt: str = Field(min_length=10, description="The test prompt")
     evaluation_criteria: str = Field(
         default="Response should be accurate, relevant, and well-structured",
@@ -161,14 +161,19 @@ class TestCase(BaseModel):
         description="Key elements expected in a good response",
     )
     difficulty: str = Field(default="medium", description="easy|medium|hard")
+    expected_answer: str = Field(default="", description="What correct answer contains (from KB)")
+    relevant_kb_sections: list[str] = Field(
+        default_factory=list,
+        description="Which KB sections have the answer",
+    )
 
     @field_validator("category", mode="before")
     @classmethod
     def validate_category(cls, v):
         """Normalize category values."""
-        valid = {"basic", "reasoning", "edge_case", "accuracy", "tool_calling", "general"}
+        valid = {"in_context", "out_of_context", "general_knowledge", "multi_fact", "edge_case", "off_topic"}
         if not v or str(v).lower() not in valid:
-            return "general"
+            return "in_context"
         return str(v).lower()
 
     @field_validator("difficulty", mode="before")
@@ -186,6 +191,16 @@ class TestCase(BaseModel):
         """Ensure expected_elements is always a list."""
         if v is None:
             return ["relevance", "accuracy", "clarity"]
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return list(v)
+
+    @field_validator("relevant_kb_sections", mode="before")
+    @classmethod
+    def ensure_kb_sections_list(cls, v):
+        """Ensure relevant_kb_sections is always a list."""
+        if v is None:
+            return []
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return list(v)
